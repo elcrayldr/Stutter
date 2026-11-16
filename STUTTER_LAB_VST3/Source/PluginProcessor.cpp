@@ -17,21 +17,28 @@ void StutterLabAudioProcessor::prepareToPlay(double sampleRate, int)
         captureBuffer.setSize(2, capacity, false, true, false);
         captureBuffer.clear();
     }
+    {
+        const juce::SpinLock::ScopedLockType lock(previewLock);
+        previewBuffer.setSize(2, 0);
+    }
     capturedSamples.store(0);
+    previewSamples.store(0);
+    previewPosition.store(0);
+    previewPlaying.store(false);
     capturing.store(false);
 }
 
 void StutterLabAudioProcessor::releaseResources()
 {
     capturing.store(false);
+    previewPlaying.store(false);
 }
 
 bool StutterLabAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
     const auto in = layouts.getMainInputChannelSet();
     const auto out = layouts.getMainOutputChannelSet();
-    return (in == juce::AudioChannelSet::mono() || in == juce::AudioChannelSet::stereo())
-        && in == out;
+    return (in == juce::AudioChannelSet::mono() || in == juce::AudioChannelSet::stereo()) && in == out;
 }
 
 void StutterLabAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -49,30 +56,49 @@ void StutterLabAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, ju
         capturing.store(true, std::memory_order_release);
     }
 
-    if (capturing.load(std::memory_order_relaxed))
+    if (capturing.load(std::memory_order_relaxed) && captureLock.tryEnter())
     {
-        // Never block the real-time thread: if the UI is taking a snapshot, skip this block.
-        if (captureLock.tryEnter())
+        const int writeAt = capturedSamples.load(std::memory_order_relaxed);
+        const int available = captureBuffer.getNumSamples() - writeAt;
+        const int amount = juce::jmin(buffer.getNumSamples(), available);
+        if (amount > 0)
         {
-            const int writeAt = capturedSamples.load(std::memory_order_relaxed);
-            const int available = captureBuffer.getNumSamples() - writeAt;
-            const int amount = juce::jmin(buffer.getNumSamples(), available);
-            if (amount > 0)
-            {
-                const int channels = juce::jmin(2, buffer.getNumChannels());
-                for (int ch = 0; ch < channels; ++ch)
-                    captureBuffer.copyFrom(ch, writeAt, buffer, ch, 0, amount);
-                if (channels == 1)
-                    captureBuffer.copyFrom(1, writeAt, buffer, 0, 0, amount);
-                capturedSamples.store(writeAt + amount, std::memory_order_release);
-            }
-            if (amount < buffer.getNumSamples())
-                capturing.store(false, std::memory_order_release);
-            captureLock.exit();
+            const int channels = juce::jmin(2, buffer.getNumChannels());
+            for (int ch = 0; ch < channels; ++ch)
+                captureBuffer.copyFrom(ch, writeAt, buffer, ch, 0, amount);
+            if (channels == 1)
+                captureBuffer.copyFrom(1, writeAt, buffer, 0, 0, amount);
+            capturedSamples.store(writeAt + amount, std::memory_order_release);
         }
+        if (amount < buffer.getNumSamples())
+            capturing.store(false, std::memory_order_release);
+        captureLock.exit();
     }
 
-    // Capture mode is non-destructive: the live signal always passes through unchanged.
+    // Preview replaces the plugin output only while explicitly auditioning the render.
+    // If the preview buffer is busy, the live input passes through for this block.
+    if (previewPlaying.load(std::memory_order_acquire) && previewLock.tryEnter())
+    {
+        const int total = previewSamples.load(std::memory_order_acquire);
+        int position = previewPosition.load(std::memory_order_relaxed);
+        const int amount = juce::jmin(buffer.getNumSamples(), juce::jmax(0, total - position));
+        if (amount > 0 && previewBuffer.getNumSamples() >= total)
+        {
+            const int outChannels = buffer.getNumChannels();
+            for (int ch = 0; ch < outChannels; ++ch)
+            {
+                const int sourceChannel = juce::jmin(ch, previewBuffer.getNumChannels() - 1);
+                buffer.copyFrom(ch, 0, previewBuffer, sourceChannel, position, amount);
+                if (amount < buffer.getNumSamples())
+                    buffer.clear(ch, amount, buffer.getNumSamples() - amount);
+            }
+            position += amount;
+            previewPosition.store(position, std::memory_order_release);
+        }
+        if (position >= total || total <= 0)
+            previewPlaying.store(false, std::memory_order_release);
+        previewLock.exit();
+    }
 }
 
 juce::AudioProcessorEditor* StutterLabAudioProcessor::createEditor()
@@ -82,7 +108,7 @@ juce::AudioProcessorEditor* StutterLabAudioProcessor::createEditor()
 
 void StutterLabAudioProcessor::startCapture()
 {
-    // The audio thread starts the next take at a block boundary.
+    previewPlaying.store(false, std::memory_order_release);
     captureStartRequested.store(true, std::memory_order_release);
 }
 
@@ -119,6 +145,7 @@ void StutterLabAudioProcessor::setSelection(double startSeconds, double endSecon
 bool StutterLabAudioProcessor::renderToWav(juce::File destination, juce::String& error)
 {
     stopCapture();
+    previewPlaying.store(false, std::memory_order_release);
 
     juce::AudioBuffer<float> capturedAudio;
     int captured = 0;
@@ -128,42 +155,31 @@ bool StutterLabAudioProcessor::renderToWav(juce::File destination, juce::String&
         return false;
     }
 
-    int start = juce::jlimit(0, captured - 1, (int) std::floor(selectionStart.load() * captureSampleRate));
-    int end = juce::jlimit(start + 1, captured, (int) std::ceil(selectionEnd.load() * captureSampleRate));
+    const int start = juce::jlimit(0, captured - 1, (int) std::floor(selectionStart.load() * captureSampleRate));
+    const int end = juce::jlimit(start + 1, captured, (int) std::ceil(selectionEnd.load() * captureSampleRate));
     const int sourceLength = end - start;
-    const int divisionIndex = rateDivision.load();
-    const int beatDenominators[] = { 2, 4, 8, 16, 32, 64 };
-    const double bpm = juce::jmax(30.0, (double) hostBpm.load());
-    const double divisionSeconds = 60.0 / bpm * 4.0 / beatDenominators[divisionIndex - 1];
-    // The rhythmic division defines the maximum stutter slice length.
-    // Do not time-stretch the selected vocal: preserve its original pitch.
-    const int gridSamples = (int) std::round(divisionSeconds * captureSampleRate);
+    const int denominators[] = { 2, 4, 8, 16, 32, 64 };
+    const double bpm = juce::jlimit(30.0, 300.0, (double) hostBpm.load());
+    const double divisionSeconds = 60.0 / bpm * 4.0 / denominators[rateDivision.load() - 1];
+    const int gridSamples = juce::jmax(32, (int) std::round(divisionSeconds * captureSampleRate));
     const int targetLength = juce::jmax(32, juce::jmin(sourceLength, gridSamples));
     const int count = repeats.load();
+
     if ((int64) targetLength * count > (int64) (captureSampleRate * 120.0))
     {
-        error = "Render exceeds the 120-second safety limit. Reduce repeats or choose a shorter slice.";
+        error = "Render exceeds the 120-second safety limit.";
         return false;
     }
 
     juce::AudioBuffer<float> chunk(2, targetLength);
+    const bool isReverse = reverse.load();
     for (int ch = 0; ch < 2; ++ch)
-    {
         for (int i = 0; i < targetLength; ++i)
         {
-            const double sourcePos = (double) i;
-            const int i0 = juce::jlimit(0, sourceLength - 1, (int) sourcePos);
-            const int i1 = juce::jmin(sourceLength - 1, i0 + 1);
-            const float frac = (float) (sourcePos - i0);
-            const int actual = reverse.load() ? end - 1 - i0 : start + i0;
-            const int actualNext = reverse.load() ? end - 1 - i1 : start + i1;
-            const float s0 = capturedAudio.getSample(ch, actual);
-            const float s1 = capturedAudio.getSample(ch, actualNext);
-            chunk.setSample(ch, i, s0 + (s1 - s0) * frac);
+            const int sourceIndex = isReverse ? end - 1 - i : start + i;
+            chunk.setSample(ch, i, capturedAudio.getSample(ch, juce::jlimit(start, end - 1, sourceIndex)));
         }
-    }
 
-    // Offline tone shaping: phone band-limit and controlled tanh saturation.
     const float drive = 1.0f + saturation.load() * 7.0f;
     const bool phone = phoneMode.load();
     if (phone || drive > 1.001f)
@@ -181,31 +197,27 @@ bool StutterLabAudioProcessor::renderToWav(juce::File destination, juce::String&
                 highPassed = hpA * (highPassed + input - previousInput);
                 previousInput = input;
                 lowPassed = (1.0f - lpA) * highPassed + lpA * lowPassed;
-                const float shaped = std::tanh(lowPassed * drive) / std::tanh(drive);
-                chunk.setSample(ch, i, shaped);
+                chunk.setSample(ch, i, std::tanh(lowPassed * drive) / std::tanh(drive));
             }
         }
     }
 
-    // Short edge fades suppress discontinuities between repeated slices.
     const int fadeSamples = juce::jmin(targetLength / 2, (int) std::round(captureSampleRate * 0.003));
-    if (fadeSamples > 0)
-        for (int ch = 0; ch < 2; ++ch)
-            for (int i = 0; i < fadeSamples; ++i)
-            {
-                const float gain = (float) i / (float) fadeSamples;
-                chunk.setSample(ch, i, chunk.getSample(ch, i) * gain);
-                chunk.setSample(ch, targetLength - 1 - i, chunk.getSample(ch, targetLength - 1 - i) * gain);
-            }
+    for (int ch = 0; ch < 2; ++ch)
+        for (int i = 0; i < fadeSamples; ++i)
+        {
+            const float gain = (float) i / (float) fadeSamples;
+            chunk.setSample(ch, i, chunk.getSample(ch, i) * gain);
+            chunk.setSample(ch, targetLength - 1 - i, chunk.getSample(ch, targetLength - 1 - i) * gain);
+        }
 
     juce::AudioBuffer<float> output(2, targetLength * count);
-    output.clear();
     for (int r = 0; r < count; ++r)
         for (int ch = 0; ch < 2; ++ch)
             output.copyFrom(ch, r * targetLength, chunk, ch, 0, targetLength);
 
-    destination.deleteFile();
     destination.getParentDirectory().createDirectory();
+    destination.deleteFile();
     std::unique_ptr<juce::FileOutputStream> stream(destination.createOutputStream());
     if (stream == nullptr)
     {
@@ -229,7 +241,83 @@ bool StutterLabAudioProcessor::renderToWav(juce::File destination, juce::String&
         error = "WAV export failed.";
         return false;
     }
+
+    // Publish a complete render only after both the audio buffer and WAV are ready.
+    {
+        const juce::SpinLock::ScopedLockType lock(previewLock);
+        previewBuffer.makeCopyOf(output, true);
+        previewSamples.store(output.getNumSamples(), std::memory_order_release);
+        previewPosition.store(0, std::memory_order_release);
+        lastRenderFile = destination;
+    }
     return true;
+}
+
+void StutterLabAudioProcessor::setPreviewPlaying(bool shouldPlay)
+{
+    if (shouldPlay && hasRenderedAudio())
+    {
+        if (previewPosition.load(std::memory_order_acquire) >= previewSamples.load(std::memory_order_acquire))
+            previewPosition.store(0, std::memory_order_release);
+        previewPlaying.store(true, std::memory_order_release);
+    }
+    else
+        previewPlaying.store(false, std::memory_order_release);
+}
+
+float StutterLabAudioProcessor::getPreviewProgress() const
+{
+    const int total = previewSamples.load(std::memory_order_acquire);
+    if (total <= 0) return -1.0f;
+    return juce::jlimit(0.0f, 1.0f, (float) previewPosition.load(std::memory_order_acquire) / (float) total);
+}
+
+std::vector<float> StutterLabAudioProcessor::getCapturePeaks(int bins) const
+{
+    bins = juce::jlimit(1, 4096, bins);
+    std::vector<float> peaks((size_t) bins, 0.0f);
+    if (!captureLock.tryEnter()) return peaks;
+    const int total = capturedSamples.load(std::memory_order_acquire);
+    if (total > 0)
+        for (int x = 0; x < bins; ++x)
+        {
+            const int a = x * total / bins;
+            const int b = juce::jmax(a + 1, (x + 1) * total / bins);
+            float peak = 0.0f;
+            for (int i = a; i < juce::jmin(total, b); ++i)
+                peak = juce::jmax(peak, juce::jmax(std::abs(captureBuffer.getSample(0, i)),
+                                                   std::abs(captureBuffer.getSample(1, i))));
+            peaks[(size_t) x] = peak;
+        }
+    captureLock.exit();
+    return peaks;
+}
+
+std::vector<float> StutterLabAudioProcessor::getPreviewPeaks(int bins) const
+{
+    bins = juce::jlimit(1, 4096, bins);
+    std::vector<float> peaks((size_t) bins, 0.0f);
+    if (!previewLock.tryEnter()) return peaks;
+    const int total = previewSamples.load(std::memory_order_acquire);
+    if (total > 0)
+        for (int x = 0; x < bins; ++x)
+        {
+            const int a = x * total / bins;
+            const int b = juce::jmax(a + 1, (x + 1) * total / bins);
+            float peak = 0.0f;
+            for (int i = a; i < juce::jmin(total, b); ++i)
+                peak = juce::jmax(peak, juce::jmax(std::abs(previewBuffer.getSample(0, i)),
+                                                   std::abs(previewBuffer.getSample(1, i))));
+            peaks[(size_t) x] = peak;
+        }
+    previewLock.exit();
+    return peaks;
+}
+
+juce::File StutterLabAudioProcessor::getLastRenderFile() const
+{
+    const juce::SpinLock::ScopedTryLockType lock(previewLock);
+    return lock.isLocked() ? lastRenderFile : juce::File();
 }
 
 void StutterLabAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
@@ -253,7 +341,11 @@ void StutterLabAudioProcessor::setStateInformation(const void* data, int sizeInB
     repeats.store(juce::jlimit(2, 32, in.readInt()));
     rateDivision.store(juce::jlimit(1, 6, in.readInt()));
     reverse.store(in.readBool());
-    if (version >= 2) { saturation.store(juce::jlimit(0.0f, 1.0f, in.readFloat())); phoneMode.store(in.readBool()); }
+    if (version >= 2)
+    {
+        saturation.store(juce::jlimit(0.0f, 1.0f, in.readFloat()));
+        phoneMode.store(in.readBool());
+    }
     selectionStart.store(juce::jmax(0.0, in.readDouble()));
     selectionEnd.store(juce::jmax(selectionStart.load() + 0.005, in.readDouble()));
 }
