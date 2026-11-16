@@ -1,4 +1,4 @@
-name: Build STUTTER LAB VST3 (Windows)
+name: Build STUTTER LAB VST3 and package Claude source
 
 on:
   workflow_dispatch:
@@ -8,6 +8,8 @@ on:
       - master
     paths:
       - "STUTTER_LAB_VST3/**"
+      - "CLAUDE_PROMPT.md"
+      - "CLAUDE_HANDOFF_STATUS.md"
       - ".github/workflows/windows-vst3.yml"
 
 permissions:
@@ -43,4 +45,44 @@ jobs:
           name: STUTTER-LAB-Windows-x64-VST3
           path: build/STUTTER_LAB_artefacts/Release/VST3/STUTTER LAB.vst3
           if-no-files-found: error
+          retention-days: 30
+
+  package-claude-source:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout complete repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Assemble clean source handoff
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP "STUTTER_LAB_CLAUDE_HANDOFF"
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          $excluded = @(".git", "build", ".vs", ".idea", "out", "cmake-build-debug", "cmake-build-release")
+          Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force |
+            Where-Object { $_.Name -notin $excluded } |
+            ForEach-Object {
+              Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force
+            }
+          if (!(Test-Path (Join-Path $destination "CLAUDE_PROMPT.md"))) {
+            throw "CLAUDE_PROMPT.md missing from source handoff."
+          }
+          if (!(Test-Path (Join-Path $destination "STUTTER_LAB_VST3/Source"))) {
+            throw "JUCE source tree missing from source handoff."
+          }
+          Write-Host "Prepared source package:"
+          Get-ChildItem -LiteralPath $destination -Recurse -File |
+            Measure-Object -Property Length -Sum |
+            Format-List Count, Sum
+
+      - name: Upload complete source ZIP for Claude
+        uses: actions/upload-artifact@v4
+        with:
+          name: STUTTER-LAB-FULL-SOURCE-FOR-CLAUDE
+          path: ${{ runner.temp }}/STUTTER_LAB_CLAUDE_HANDOFF/
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 9
           retention-days: 30
