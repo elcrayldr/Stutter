@@ -1,0 +1,46 @@
+name: Build STUTTER LAB VST3 (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "STUTTER_LAB_VST3/**"
+      - ".github/workflows/windows-vst3.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure x64 Release
+        run: cmake -S STUTTER_LAB_VST3 -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build VST3
+        run: cmake --build build --config Release --target STUTTER_LAB_VST3 --parallel
+
+      - name: Verify VST3 bundle
+        shell: pwsh
+        run: |
+          $plugin = "build/STUTTER_LAB_artefacts/Release/VST3/STUTTER LAB.vst3"
+          if (!(Test-Path $plugin)) {
+            Write-Error "VST3 bundle not found at: $plugin"
+            Get-ChildItem -Path build -Recurse -Directory | Select-Object -ExpandProperty FullName
+            exit 1
+          }
+          Get-ChildItem -Path $plugin -Recurse | Select-Object FullName, Length
+
+      - name: Upload VST3 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: STUTTER-LAB-Windows-x64-VST3
+          path: build/STUTTER_LAB_artefacts/Release/VST3/STUTTER LAB.vst3
+          if-no-files-found: error
+          retention-days: 30
