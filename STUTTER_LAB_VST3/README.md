@@ -16,7 +16,6 @@ Implemented in source:
 - External file drag-and-drop attempt after render.
 - Save As WAV export dialog as a fallback workflow.
 - Basic parameter state persistence.
-- Windows GitHub Actions build workflow.
 
 Not yet implemented: pitch/formant shifting, tempo-synchronised delay, chorus, reverb/reverse reverb, preset browser, full drag/drop host validation, automated host tests, installer/signing, and a polished final GUI. The current Phone/Drive controls are render-stage processing, not real-time inserts.
 
@@ -27,25 +26,27 @@ Requirements:
 - CMake 3.22+
 - Git and an internet connection for JUCE FetchContent on first configure
 
+Run from the repository root:
+
 ```powershell
-cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+cmake -S STUTTER_LAB_VST3 -B build -A x64 -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --target STUTTER_LAB_VST3 --parallel
 ```
 
 Expected artifact:
 
-`build\\STUTTER_LAB_artefacts\\Release\\VST3\\STUTTER LAB.vst3`
+`build\STUTTER_LAB_artefacts\Release\VST3\STUTTER LAB.vst3`
 
 Copy the `.vst3` bundle to:
 
-`C:\\Program Files\\Common Files\\VST3\\`
+`C:\Program Files\Common Files\VST3\`
 
 Rescan plugins in FL Studio 26 or Cubase 13.
 
 ## GitHub Actions
 
-Push this repository to GitHub and run **Build STUTTER LAB VST3 (Windows)** from Actions, or push a change to `main`/`master`. The workflow builds the x64 VST3 and publishes it as an Actions artifact. This workflow has been authored but has not yet been executed in this environment.
+The Windows workflow is located at `.github/workflows/windows-vst3.yml`. Run **Build STUTTER LAB VST3 (Windows)** from Actions, or push a change to `STUTTER_LAB_VST3/**` on `main`/ `master`. The workflow builds the x64 VST3 and publishes it as an Actions artifact.
 
 ## Important
 
-This is an active development source milestone, not a release-certified plugin. The Linux session used to edit this source has no network access to fetch JUCE, so no successful compile or DAW validation is claimed. Test the resulting artifact in both target DAWs before distribution.
+This is an active development source milestone, not a release-certified plugin. No successful compile or DAW validation is claimed until the Actions build and manual host tests have passed.
