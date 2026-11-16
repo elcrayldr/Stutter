@@ -1,4 +1,6 @@
 #include "PluginEditor.h"
+#include <algorithm>
+#include <array>
 
 namespace
 {
