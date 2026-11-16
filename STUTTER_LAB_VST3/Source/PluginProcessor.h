@@ -1,6 +1,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include <atomic>
+#include <vector>
 
 class StutterLabAudioProcessor final : public juce::AudioProcessor
 {
@@ -32,7 +33,6 @@ public:
     void stopCapture();
     bool isCapturing() const { return capturing.load(); }
     int getCapturedSamples() const { return capturedSamples.load(); }
-    int getCaptureCapacity() const { return captureBuffer.getNumSamples(); }
     double getCaptureSampleRate() const { return captureSampleRate; }
     float getHostBpm() const { return hostBpm.load(); }
     bool copyCaptureSnapshot(juce::AudioBuffer<float>& destination, int& samples) const;
@@ -53,6 +53,15 @@ public:
     void setPhoneMode(bool value) { phoneMode.store(value); }
     bool getPhoneMode() const { return phoneMode.load(); }
 
+    void setPreviewPlaying(bool shouldPlay);
+    bool isPreviewPlaying() const { return previewPlaying.load(); }
+    bool hasRenderedAudio() const { return previewSamples.load() > 0; }
+    int getPreviewSamples() const { return previewSamples.load(); }
+    float getPreviewProgress() const;
+    std::vector<float> getCapturePeaks(int bins) const;
+    std::vector<float> getPreviewPeaks(int bins) const;
+    juce::File getLastRenderFile() const;
+
 private:
     juce::AudioBuffer<float> captureBuffer;
     mutable juce::SpinLock captureLock;
@@ -60,7 +69,7 @@ private:
     std::atomic<bool> captureStartRequested { false };
     std::atomic<int> capturedSamples { 0 };
     std::atomic<int> repeats { 4 };
-    std::atomic<int> rateDivision { 4 }; // index: 1/2, 1/4, 1/8, 1/16, 1/32, 1/64
+    std::atomic<int> rateDivision { 4 };
     std::atomic<bool> reverse { false };
     std::atomic<float> saturation { 0.0f };
     std::atomic<bool> phoneMode { false };
@@ -69,6 +78,14 @@ private:
     std::atomic<double> selectionEnd { 0.5 };
     double captureSampleRate = 44100.0;
     int maxCaptureSeconds = 30;
+
+    // Render memory is written offline and read by the audio callback for preview.
+    juce::AudioBuffer<float> previewBuffer;
+    mutable juce::SpinLock previewLock;
+    std::atomic<int> previewSamples { 0 };
+    std::atomic<int> previewPosition { 0 };
+    std::atomic<bool> previewPlaying { false };
+    juce::File lastRenderFile;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StutterLabAudioProcessor)
 };
