@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(STUTTER_LAB VERSION 0.2.0)
+project(STUTTER_LAB VERSION 0.2.1)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +28,9 @@ juce_add_plugin(STUTTER_LAB
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
     COPY_PLUGIN_AFTER_BUILD FALSE
 )
+
+# Generate JuceHeader.h for the source files that include it.
+juce_generate_juce_header(STUTTER_LAB)
 
 target_sources(STUTTER_LAB PRIVATE
     Source/PluginProcessor.cpp
